@@ -1,0 +1,167 @@
+name: editalmind
+
+x-minio-env: &minio-env
+  MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
+  MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+  MC_CONFIG_DIR: /tmp/.mc
+  MC_HOST_local: http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@localhost:9000
+
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-editalmind}
+      MYSQL_USER: ${MYSQL_USER:-editalmind}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:${MYSQL_PORT:-3307}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      # TCP on 127.0.0.1 so the temporary init server (socket only) is not reported healthy.
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+      start_interval: 2s
+
+  mongo:
+    # Atlas Local ships mongod with Atlas Search and Vector Search enabled.
+    image: mongodb/mongodb-atlas-local:8
+    environment:
+      MONGODB_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-editalmind}
+      MONGODB_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?set MONGO_ROOT_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:${MONGO_PORT:-27017}:27017"
+    volumes:
+      - mongo-data:/data/db
+      - mongo-config:/data/configdb
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/runner", "healthcheck"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+      start_interval: 3s
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+      start_interval: 1s
+
+  minio:
+    # The upstream minio/minio image is no longer published; Chainguard builds MinIO from source.
+    image: cgr.dev/chainguard/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment: *minio-env
+    ports:
+      - "127.0.0.1:${MINIO_API_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+      start_interval: 1s
+
+  minio-init:
+    # One-shot job run by `make up` after the stack is healthy; creates the bucket idempotently.
+    image: cgr.dev/chainguard/minio:latest
+    profiles: ["init"]
+    entrypoint: ["mc"]
+    command: ["mb", "--ignore-existing", "local/${S3_BUCKET:-editalmind-editais}"]
+    environment:
+      <<: *minio-env
+      MC_HOST_local: http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@minio:9000
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: "no"
+
+  mailpit:
+    image: axllent/mailpit:latest
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "true"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
+    ports:
+      - "127.0.0.1:${MAILPIT_SMTP_PORT:-1025}:1025"
+      - "127.0.0.1:${MAILPIT_UI_PORT:-8025}:8025"
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+      start_interval: 1s
+
+  # Application services (profile "apps"), built from the repositories cloned side by side.
+  api:
+    profiles: ["apps"]
+    image: editalmind-api:local
+    build: ../editalmind-api
+    environment:
+      API_ENVIRONMENT: local
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    depends_on:
+      mysql: { condition: service_healthy }
+      mongo: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  ai-api:
+    profiles: ["apps"]
+    image: editalmind-ai:local
+    build: ../editalmind-ai
+    environment: &ai-env
+      AI_ENVIRONMENT: local
+      AI_REDIS_URL: redis://redis:6379/0
+    ports:
+      - "127.0.0.1:${AI_API_PORT:-8001}:8001"
+    depends_on:
+      redis: { condition: service_healthy }
+      mongo: { condition: service_healthy }
+
+  ai-worker:
+    profiles: ["apps"]
+    image: editalmind-ai:local
+    command: ["celery", "-A", "editalmind_ai.worker", "worker", "--loglevel", "INFO", "--concurrency", "4"]
+    environment: *ai-env
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A editalmind_ai.worker inspect ping --destination celery@$$HOSTNAME --timeout 5"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+      start_interval: 2s
+    depends_on:
+      ai-api: { condition: service_started }
+      redis: { condition: service_healthy }
+
+  web:
+    profiles: ["apps"]
+    image: editalmind-web:local
+    build: ../editalmind-web
+    ports:
+      - "127.0.0.1:${WEB_PORT:-8080}:8080"
+
+volumes:
+  mysql-data:
+  mongo-data:
+  mongo-config:
+  redis-data:
+  minio-data:
