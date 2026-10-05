@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: cp .env.example .env
+      - run: make config
+      # Boots the infrastructure from scratch and fails if any health check does not pass.
+      - run: make up
+      - run: make ps
+      - if: failure()
+        run: docker compose -f compose.dev.yml --env-file .env logs --tail=200
+      - if: always()
+        run: make reset
