@@ -13,8 +13,9 @@ permissions:
   contents: read
 
 jobs:
-  compose:
+  pipeline:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - run: cp .env.example .env
